@@ -71,6 +71,13 @@ struct Paragraph {
 
     /// In case of an empty paragraph ("\n"), use this as height.
     pub empty_paragraph_height: f32,
+
+    /// The bidi embedding level of each glyph (parallel to `glyphs`),
+    /// if the job contains any bidirectional text.
+    ///
+    /// `None` when the whole job is LTR, in which case layout is
+    /// bit-for-bit identical to not having bidi support at all.
+    pub bidi_levels: Option<Vec<u8>>,
 }
 
 impl Paragraph {
@@ -80,8 +87,37 @@ impl Paragraph {
             section_index_at_start,
             glyphs: vec![],
             empty_paragraph_height: 0.0,
+            bidi_levels: None,
         }
     }
+}
+
+/// Does the text contain anything that could trigger right-to-left layout
+/// or otherwise affect the bidirectional algorithm?
+///
+/// When this returns `false` (the common case), layout takes the exact
+/// same code paths as if bidi support did not exist.
+fn text_needs_bidi(text: &str) -> bool {
+    use unicode_bidi::{BidiClass, bidi_class};
+
+    text.chars().any(|chr| {
+        // No character below U+0590 is RTL or a bidi control.
+        chr >= '\u{0590}'
+            && matches!(
+                bidi_class(chr),
+                BidiClass::R // Hebrew and friends
+                | BidiClass::AL // Arabic and friends
+                | BidiClass::RLE
+                | BidiClass::RLO
+                | BidiClass::RLI
+                | BidiClass::LRE
+                | BidiClass::LRO
+                | BidiClass::LRI
+                | BidiClass::FSI
+                | BidiClass::PDF
+                | BidiClass::PDI
+            )
+    })
 }
 
 /// Layout text into a [`Galley`].
@@ -110,6 +146,12 @@ pub(crate) fn layout(fonts: &mut FontsImpl, pixels_per_point: f32, job: Arc<Layo
 
     // For most of this we ignore the y coordinate:
 
+    // Compute bidi embedding levels for the whole job once, if needed.
+    // `unicode_bidi` handles malformed isolate sequences (unmatched LRI/PDI etc)
+    // gracefully, per the Unicode Bidirectional Algorithm.
+    let bidi_info = text_needs_bidi(&job.text)
+        .then(|| unicode_bidi::BidiInfo::new(&job.text, None));
+
     let mut paragraphs = vec![Paragraph::from_section_index(0)];
     {
         let mut shape_buffer = fonts.take_shape_buffer();
@@ -121,6 +163,7 @@ pub(crate) fn layout(fonts: &mut FontsImpl, pixels_per_point: f32, job: Arc<Layo
                 &job,
                 section_index as u32,
                 section,
+                bidi_info.as_ref(),
                 &mut paragraphs,
             );
         }
@@ -132,7 +175,7 @@ pub(crate) fn layout(fonts: &mut FontsImpl, pixels_per_point: f32, job: Arc<Layo
     let intrinsic_size = calculate_intrinsic_size(point_scale, &job, &paragraphs);
 
     let mut elided = false;
-    let mut rows = rows_from_paragraphs(paragraphs, &job, pixels_per_point, &mut elided);
+    let mut rows = rows_from_paragraphs(paragraphs, &job, point_scale, &mut elided);
     if elided && let Some(last_placed) = rows.last_mut() {
         let last_row = Arc::make_mut(&mut last_placed.row);
         replace_last_glyph_with_overflow_character(fonts, pixels_per_point, &job, last_row);
@@ -147,7 +190,12 @@ pub(crate) fn layout(fonts: &mut FontsImpl, pixels_per_point: f32, job: Arc<Layo
         let num_rows = rows.len();
         for (i, placed_row) in rows.iter_mut().enumerate() {
             let is_last_row = i + 1 == num_rows;
-            let justify_row = justify && !placed_row.ends_with_newline && !is_last_row;
+            // Justification distributes extra space between glyphs in logical order,
+            // which would scramble visually-reordered bidirectional rows.
+            let justify_row = justify
+                && !placed_row.ends_with_newline
+                && !is_last_row
+                && placed_row.row.bidi_levels.is_none();
             halign_and_justify_row(
                 point_scale,
                 placed_row,
@@ -215,6 +263,12 @@ struct TextRun {
     /// Byte range within the section text.
     byte_range: ByteRange,
 
+    /// Whether this run has an odd bidi embedding level,
+    /// i.e. should be shaped right-to-left.
+    ///
+    /// Always `false` when the job has no bidirectional text.
+    rtl: bool,
+
     /// Set if a priority [`GlyphRasterizer`](crate::text::GlyphRasterizer) rendered this run.
     ///
     /// Such a run is exactly one grapheme cluster, and is not shaped.
@@ -247,7 +301,20 @@ fn layout_shaped_run(
     let mut cluster_start_byte: usize = 0;
     let mut cluster_glyph_count: usize = 0;
 
-    for (info, pos) in iter::zip(glyph_buffer.glyph_infos(), glyph_buffer.glyph_positions()) {
+    // For RTL runs the shaper outputs glyphs in visual order (with descending
+    // cluster values). Iterate the buffer backwards so that glyphs are always
+    // emitted in logical order — the invariant `glyphs.len() == char_count`
+    // and all cursor math depend on it. The visual re-ordering happens later,
+    // per row, in `reorder_row_for_bidi`.
+    let num_shaped_glyphs = glyph_buffer.len();
+    for i in 0..num_shaped_glyphs {
+        let glyph_index = if run.rtl {
+            num_shaped_glyphs - 1 - i
+        } else {
+            i
+        };
+        let info = &glyph_buffer.glyph_infos()[glyph_index];
+        let pos = &glyph_buffer.glyph_positions()[glyph_index];
         let glyph_id = skrifa::GlyphId::new(info.glyph_id);
         let cluster = info.cluster;
         let mut advance_width_px = pos.x_advance as f32 * px_scale;
@@ -513,6 +580,7 @@ fn emit_continuation_glyphs(
 }
 
 // Ignores the Y coordinate.
+#[expect(clippy::too_many_arguments)]
 fn layout_section(
     fonts: &mut FontsImpl,
     shape_buffer: &mut harfrust::Buffer,
@@ -520,6 +588,7 @@ fn layout_section(
     job: &LayoutJob,
     section_index: u32,
     section: &LayoutSection,
+    bidi_info: Option<&unicode_bidi::BidiInfo<'_>>,
     out_paragraphs: &mut Vec<Paragraph>,
 ) {
     let LayoutSection {
@@ -536,6 +605,9 @@ fn layout_section(
         .line_height
         .unwrap_or(font_metrics.row_height);
     let extra_letter_spacing = section.format.extra_letter_spacing;
+
+    // The bidi levels of this section, indexed by byte offset into `job.text`.
+    let section_levels = bidi_info.map(|info| &info.levels[byte_range.as_usize()]);
 
     let mut paragraph = out_paragraphs.last_mut().unwrap();
     if paragraph.glyphs.is_empty() {
@@ -559,7 +631,13 @@ fn layout_section(
     let mut runs = Vec::new();
 
     // Process each paragraph segment (split on newlines — the shaper can't handle them).
+    let mut segment_byte_offset = 0;
     for (seg_idx, segment) in SplitOrWhole::new(section_text, job.break_on_newline).enumerate() {
+        // The bidi levels of this segment, indexed by byte offset into the segment.
+        let segment_levels = section_levels
+            .and_then(|levels| levels.get(segment_byte_offset..segment_byte_offset + segment.len()));
+        segment_byte_offset += segment.len() + 1; // +1 for the '\n' (harmless if there is none).
+
         if 0 < seg_idx {
             paragraph = out_paragraphs.push_mut(Paragraph::from_section_index(section_index));
             paragraph.empty_paragraph_height = line_height;
@@ -570,7 +648,26 @@ fn layout_section(
             continue;
         }
 
-        segment_into_runs(fonts, &ctx, segment, &mut runs);
+        if let Some(segment_levels) = segment_levels {
+            // One level per char, matching the one-glyph-per-char invariant:
+            if let Some(levels) = &mut paragraph.bidi_levels {
+                debug_assert_eq!(
+                    levels.len(),
+                    paragraph.glyphs.len(),
+                    "bidi levels out of sync with glyphs"
+                );
+            }
+            paragraph
+                .bidi_levels
+                .get_or_insert_with(Vec::new)
+                .extend(
+                    segment
+                        .char_indices()
+                        .map(|(byte_idx, _)| segment_levels[byte_idx].number()),
+                );
+        }
+
+        segment_into_runs(fonts, &ctx, segment, segment_levels, &mut runs);
 
         let num_runs = runs.len();
         for (run_idx, run) in runs.iter().enumerate() {
@@ -599,7 +696,14 @@ fn layout_section(
                 flags |= harfrust::BufferFlags::END_OF_TEXT;
             }
 
-            shape_text(font_face, run_text, &format.coords, shape_buffer, flags);
+            shape_text(
+                font_face,
+                run_text,
+                &format.coords,
+                shape_buffer,
+                flags,
+                run.rtl,
+            );
 
             layout_shaped_run(
                 fonts,
@@ -683,10 +787,11 @@ fn calculate_intrinsic_size(
 fn rows_from_paragraphs(
     paragraphs: Vec<Paragraph>,
     job: &LayoutJob,
-    pixels_per_point: f32,
+    point_scale: PointScale,
     elided: &mut bool,
 ) -> Vec<PlacedRow> {
     let num_paragraphs = paragraphs.len();
+    let pixels_per_point = point_scale.pixels_per_point();
 
     let mut rows = vec![];
 
@@ -698,6 +803,8 @@ fn rows_from_paragraphs(
 
         let is_last_paragraph = (i + 1) == num_paragraphs;
 
+        let rows_before = rows.len();
+
         if paragraph.glyphs.is_empty() {
             rows.push(PlacedRow {
                 pos: pos2(0.0, f32::NAN),
@@ -706,6 +813,7 @@ fn rows_from_paragraphs(
                     glyphs: vec![],
                     visuals: Default::default(),
                     size: vec2(0.0, paragraph.empty_paragraph_height),
+                    bidi_levels: None,
                 }),
                 ends_with_newline: !is_last_paragraph,
             });
@@ -723,6 +831,7 @@ fn rows_from_paragraphs(
                         glyphs: paragraph.glyphs,
                         visuals: Default::default(),
                         size: vec2(paragraph_width, 0.0),
+                        bidi_levels: None,
                     }),
                     ends_with_newline: !is_last_paragraph,
                 });
@@ -732,9 +841,68 @@ fn rows_from_paragraphs(
                 placed_row.ends_with_newline = !is_last_paragraph;
             }
         }
+
+        // Reorder the glyphs of each row into visual order (UBA rule L2).
+        //
+        // Line breaking above is done in logical order, as prescribed by the UBA;
+        // here we assign each glyph its visual x position within its row.
+        // Pure-LTR rows are left completely untouched.
+        if let Some(levels) = paragraph.bidi_levels {
+            let mut glyph_offset = 0;
+            for placed_row in &mut rows[rows_before..] {
+                let num_glyphs = placed_row.row.glyphs.len();
+                let Some(row_levels) = levels.get(glyph_offset..glyph_offset + num_glyphs) else {
+                    debug_assert!(false, "bidi levels out of sync with glyphs");
+                    break;
+                };
+                glyph_offset += num_glyphs;
+                let row = Arc::make_mut(&mut placed_row.row);
+                row.bidi_levels = reorder_row_for_bidi(&mut row.glyphs, row_levels, point_scale);
+            }
+        }
     }
 
     rows
+}
+
+/// Reorder the glyphs of a single row into visual order (UBA rule L2),
+/// returning the per-glyph bidi levels to store on the row.
+///
+/// The glyphs stay in logical order in the vector (so `glyphs[i]` is still
+/// the `i`th character, and all cursor math keeps working); only their
+/// x positions are re-assigned into visual order. The row's overall width
+/// is preserved.
+///
+/// Returns `None` for pure-LTR rows, which are left completely untouched.
+fn reorder_row_for_bidi(
+    glyphs: &mut [Glyph],
+    levels: &[u8],
+    point_scale: PointScale,
+) -> Option<Vec<u8>> {
+    if glyphs.len() != levels.len() {
+        debug_assert!(false, "bidi levels out of sync with glyphs");
+        return None; // Degrade to logical order rather than panic.
+    }
+    if !levels.iter().any(|level| level % 2 == 1) {
+        return None; // Pure LTR row: nothing to do.
+    }
+
+    // `index_map[visual_index] == logical_index` (UBA rule L2):
+    let levels_vec: Vec<unicode_bidi::Level> = levels.iter().copied().map(From::from).collect();
+    let index_map = unicode_bidi::BidiInfo::reorder_visual(&levels_vec);
+
+    // Re-assign x positions in visual order, pixel-snapped like the shaper did:
+    let mut x = glyphs
+        .iter()
+        .map(|glyph| glyph.pos.x)
+        .fold(f32::INFINITY, f32::min);
+    for &logical_index in &index_map {
+        let glyph = &mut glyphs[logical_index];
+        glyph.pos.x = point_scale.round_to_pixel(x);
+        x += glyph.advance_width;
+    }
+
+    Some(levels.to_vec())
 }
 
 fn line_break(
@@ -775,6 +943,7 @@ fn line_break(
                         glyphs: vec![],
                         visuals: Default::default(),
                         size: Vec2::ZERO,
+                        bidi_levels: None,
                     }),
                     ends_with_newline: false,
                 });
@@ -801,6 +970,7 @@ fn line_break(
                         glyphs,
                         visuals: Default::default(),
                         size: vec2(paragraph_max_x, 0.0),
+                        bidi_levels: None,
                     }),
                     ends_with_newline: false,
                 });
@@ -844,6 +1014,7 @@ fn line_break(
                     glyphs,
                     visuals: Default::default(),
                     size: vec2(paragraph_max_x - paragraph_min_x, 0.0),
+                    bidi_levels: None,
                 }),
                 ends_with_newline: false,
             });
@@ -907,7 +1078,19 @@ fn replace_last_glyph_with_overflow_character(
         };
 
         let overflow_glyph_x = if let Some(prev_glyph) = row.glyphs.last() {
-            prev_glyph.max_x() + extra_letter_spacing
+            if row.bidi_levels.is_some() {
+                // The glyphs are in logical order but their positions are visual;
+                // put the overflow character at the visual end of the row.
+                // (For an RTL paragraph it should ideally be on the left — a
+                // known limitation of this minimal bidi support.)
+                row.glyphs
+                    .iter()
+                    .map(|glyph| glyph.max_x())
+                    .fold(f32::NEG_INFINITY, f32::max)
+                    + extra_letter_spacing
+            } else {
+                prev_glyph.max_x() + extra_letter_spacing
+            }
         } else {
             0.0 // TODO(emilk): heed paragraph leading_space 😬
         };
@@ -961,11 +1144,20 @@ fn replace_last_glyph_with_overflow_character(
                 section_index,
                 first_vertex: 0, // filled in later
             });
+            if let Some(levels) = &mut row.bidi_levels {
+                // Keep the levels parallel to the glyphs.
+                // The overflow character sits at the visual end of the row;
+                // its exact level only affects caret placement next to it.
+                levels.push(0);
+            }
             return;
         }
 
         // We didn't fit - pop the last glyph and try again.
         if let Some(last_glyph) = row.glyphs.pop() {
+            if let Some(levels) = &mut row.bidi_levels {
+                levels.pop();
+            }
             section_index = last_glyph.section_index;
         } else {
             section_index = row.section_index_at_start;
@@ -1016,8 +1208,23 @@ fn halign_and_justify_row(
     let num_glyphs_in_range = glyph_range.1 - glyph_range.0;
     assert!(num_glyphs_in_range > 0, "Should have at least one glyph");
 
-    let original_min_x = row.glyphs[glyph_range.0].logical_rect().min.x;
-    let original_max_x = row.glyphs[glyph_range.1 - 1].logical_rect().max.x;
+    let (original_min_x, original_max_x) = if row.bidi_levels.is_some() {
+        // The glyphs are in logical order but their positions are visual,
+        // so the first/last glyphs are not necessarily the left/right-most.
+        let mut min_x = f32::INFINITY;
+        let mut max_x = f32::NEG_INFINITY;
+        for glyph in &row.glyphs[glyph_range.0..glyph_range.1] {
+            let rect = glyph.logical_rect();
+            min_x = min_x.min(rect.min.x);
+            max_x = max_x.max(rect.max.x);
+        }
+        (min_x, max_x)
+    } else {
+        (
+            row.glyphs[glyph_range.0].logical_rect().min.x,
+            row.glyphs[glyph_range.1 - 1].logical_rect().max.x,
+        )
+    };
     let original_width = original_max_x - original_min_x;
 
     let target_width = if justify && num_glyphs_in_range > 1 {
@@ -1515,7 +1722,8 @@ impl RowBreakCandidates {
 
 // ----------------------------------------------------------------------------
 
-/// Segment text into runs where each run uses a single font face.
+/// Segment text into runs where each run uses a single font face
+/// and has a single text direction.
 ///
 /// Grapheme clusters are never split across runs: if a combining mark
 /// falls back to a different font than its base character, it stays
@@ -1524,10 +1732,16 @@ impl RowBreakCandidates {
 /// Clusters that a priority [`GlyphRasterizer`](crate::text::GlyphRasterizer)
 /// handles get a run of their own, with [`TextRun::raster`] set.
 ///
-/// NOTE: Segmentation is by font face, not by Unicode script. A run may
-/// mix scripts (e.g. Latin + Cyrillic) when they share the same font.
-/// This is acceptable for scripts with similar shaping rules, but would
-/// need script-aware splitting once RTL/bidi support is added.
+/// `levels` is the per-byte bidi embedding levels of `text`, if the job
+/// contains bidirectional text. Runs are then also split whenever the
+/// direction (odd/even level) changes, so that each run can be shaped
+/// with the correct direction. Without `levels`, segmentation is by font
+/// face only, exactly as if bidi support did not exist.
+///
+/// NOTE: Segmentation is by font face and direction, not by Unicode script.
+/// A run may mix scripts (e.g. Latin + Cyrillic) when they share the same
+/// font and direction. This is acceptable for scripts with similar shaping
+/// rules.
 ///
 /// Results are appended to `out` (which is cleared first) to allow
 /// the caller to reuse the allocation across calls.
@@ -1535,6 +1749,7 @@ fn segment_into_runs(
     fonts: &mut FontsImpl,
     ctx: &ShapingContext,
     text: &str,
+    levels: Option<&[unicode_bidi::Level]>,
     out: &mut Vec<TextRun>,
 ) {
     use unicode_segmentation::UnicodeSegmentation as _;
@@ -1544,6 +1759,11 @@ fn segment_into_runs(
     for (byte_offset, grapheme_str) in text.grapheme_indices(true) {
         let byte_offset = ByteIndex(byte_offset);
         let byte_end = byte_offset + grapheme_str.len();
+
+        // Does this grapheme belong to an RTL (odd) embedding level?
+        let rtl = levels
+            .and_then(|levels| levels.get(byte_offset.0))
+            .is_some_and(unicode_bidi::Level::is_rtl);
 
         if let Some(raster) = fonts.rasterize_cluster(
             FontPriority::Highest,
@@ -1555,6 +1775,7 @@ fn segment_into_runs(
             out.push(TextRun {
                 font_key: FontFaceKey::INVALID,
                 byte_range: byte_offset..byte_end,
+                rtl,
                 raster: Some(raster),
             });
             continue;
@@ -1574,6 +1795,7 @@ fn segment_into_runs(
             out.push(TextRun {
                 font_key,
                 byte_range: byte_offset..byte_end,
+                rtl,
                 raster: Some(raster),
             });
             continue;
@@ -1582,6 +1804,7 @@ fn segment_into_runs(
         if let Some(last_run) = out.last_mut()
             && last_run.raster.is_none()
             && last_run.font_key == font_key
+            && last_run.rtl == rtl
         {
             last_run.byte_range.end = byte_end;
             continue;
@@ -1589,12 +1812,17 @@ fn segment_into_runs(
         out.push(TextRun {
             font_key,
             byte_range: byte_offset..byte_end,
+            rtl,
             raster: None,
         });
     }
 }
 
 /// Shape a text run into `buffer`, replacing its (empty) contents with positioned glyphs.
+///
+/// `rtl` is the text direction of the run (from its bidi embedding level).
+/// For RTL runs the shaped glyphs come out of the shaper in visual order;
+/// it is up to the caller to iterate them accordingly.
 ///
 /// The caller should iterate `glyph_infos()` / `glyph_positions()` (both
 /// `Copy` slices) and convert font units to pixels using `metrics.px_scale_factor`.
@@ -1605,6 +1833,7 @@ fn shape_text(
     coords: &VariationCoords,
     buffer: &mut harfrust::Buffer,
     flags: harfrust::BufferFlags,
+    rtl: bool,
 ) {
     let base_font = font_face.shaper_font();
     let tweak = font_face.tweak();
@@ -1621,6 +1850,14 @@ fn shape_text(
     buffer.set_flags(flags);
     buffer.push_str(text);
     buffer.guess_segment_properties();
+    // `guess_segment_properties` derives the direction from the first strong
+    // character, which is wrong for runs that start with (or consist of)
+    // neutral characters. The bidi levels know the truth:
+    buffer.set_direction(if rtl {
+        harfrust::Direction::RightToLeft
+    } else {
+        harfrust::Direction::LeftToRight
+    });
 
     let shaper_font = harfrust::ShaperFont::new(font);
     if let Err(err) = harfrust::shape(&shaper_font, buffer, harfrust::ShapeOptions::new()) {
@@ -2764,5 +3001,241 @@ mod tests {
         let glyphs = &galley.rows[0].row.glyphs;
         let details: Vec<_> = glyphs.iter().map(|g| (g.chr, g.advance_width)).collect();
         (galley.size().x, glyphs.len(), details)
+    }
+
+    // ------------------------------------------------------------------------
+    // Bidi tests
+
+    /// The default fonts have no Arabic glyphs, so Arabic renders as tofu —
+    /// but the bidi reordering is independent of which glyphs are used.
+    fn layout_bidi(text: &str) -> Galley {
+        let mut fonts = test_fonts();
+        layout_simple(&mut fonts, text)
+    }
+
+    #[test]
+    fn bidi_detection() {
+        assert!(!text_needs_bidi("Hello, world! 123"));
+        assert!(!text_needs_bidi("ÅÄÖ é ü 日本語"));
+        assert!(text_needs_bidi("مرحبا"));
+        assert!(text_needs_bidi("שלום"));
+        assert!(text_needs_bidi("Hello مرحبا"));
+        assert!(text_needs_bidi("a\u{2067}b\u{2069}")); // RLI … PDI
+        assert!(text_needs_bidi("\u{202B}")); // RLE
+        assert!(!text_needs_bidi("\u{200E}")); // LRM alone is harmless…
+    }
+
+    #[test]
+    fn pure_ltr_rows_are_untouched_by_bidi() {
+        let galley = layout_bidi("Hello, world! 123");
+        for row in &galley.rows {
+            assert!(
+                row.row.bidi_levels.is_none(),
+                "pure LTR rows must not get bidi levels"
+            );
+            // x positions must be monotone increasing in logical order:
+            let glyphs = &row.row.glyphs;
+            for (a, b) in glyphs.iter().zip(glyphs.iter().skip(1)) {
+                assert!(a.pos.x <= b.pos.x, "LTR glyph x positions must be monotone");
+            }
+        }
+    }
+
+    #[test]
+    fn rtl_text_is_reordered_visually() {
+        let text = "ابتث"; // four Arabic letters
+        let galley = layout_bidi(text);
+        assert_eq!(galley.rows.len(), 1);
+        let row = &galley.rows[0].row;
+
+        // Glyphs stay in logical order, one per char:
+        assert_eq!(row.text(), text);
+        assert_eq!(row.glyphs.len(), text.chars().count());
+
+        // …but their x positions are in visual (right-to-left) order:
+        let levels = row.bidi_levels.as_ref().expect("RTL row should have levels");
+        assert!(levels.iter().all(|&level| level == 1));
+        for (a, b) in row.glyphs.iter().zip(row.glyphs.iter().skip(1)) {
+            assert!(
+                a.pos.x > b.pos.x,
+                "RTL glyphs should advance right-to-left: {a:?} vs {b:?}"
+            );
+        }
+
+        // The row width is the sum of the advances, same as for LTR text:
+        let advance_sum: f32 = row.glyphs.iter().map(|g| g.advance_width).sum();
+        let min_x = row.glyphs.iter().map(|g| g.pos.x).fold(f32::INFINITY, f32::min);
+        let max_x = row
+            .glyphs
+            .iter()
+            .map(|g| g.max_x())
+            .fold(f32::NEG_INFINITY, f32::max);
+        assert!((max_x - min_x - advance_sum).abs() < 1.0);
+    }
+
+    #[test]
+    fn mixed_bidi_text_visual_order() {
+        let text = "abc مرحبا";
+        let galley = layout_bidi(text);
+        assert_eq!(galley.rows.len(), 1);
+        let row = &galley.rows[0].row;
+        assert_eq!(row.text(), text, "glyphs stay in logical order");
+
+        let levels = row.bidi_levels.as_ref().unwrap();
+        // Latin part is level 0, Arabic part is odd:
+        assert!(levels[..4].iter().all(|&l| l % 2 == 0));
+        assert!(levels[4..].iter().all(|&l| l % 2 == 1));
+
+        let x = |chr: char| {
+            row.glyphs
+                .iter()
+                .find(|g| g.chr == chr)
+                .unwrap_or_else(|| panic!("no glyph for {chr:?}"))
+                .pos
+                .x
+        };
+        // Latin runs left-to-right on the left…
+        assert!(x('a') < x('b') && x('b') < x('c'));
+        // …and the Arabic word sits to the right of the Latin text…
+        assert!(x('c') < x('م'));
+        // …with its letters laid out right-to-left:
+        assert!(x('م') > x('ح') && x('ح') > x('ب'));
+    }
+
+    #[test]
+    fn bidi_numbers_stay_ltr_within_rtl_text() {
+        // European digits in RTL context get an even (LTR) embedding level
+        // and must keep their left-to-right order.
+        let text = "مرحبا 123";
+        let galley = layout_bidi(text);
+        let row = &galley.rows[0].row;
+        let x = |chr: char| row.glyphs.iter().find(|g| g.chr == chr).unwrap().pos.x;
+        assert!(x('1') < x('2') && x('2') < x('3'), "digits must stay LTR");
+    }
+
+    #[test]
+    fn bidi_malformed_isolates_degrade_gracefully() {
+        let texts = [
+            "\u{2067}مرحبا",             // unterminated RLI
+            "\u{2066}abc",                // unterminated LRI
+            "\u{2068}مرحبا",              // unterminated FSI
+            "مرحبا\u{2069}",              // stray PDI
+            "abc\u{2069}",                // stray PDI in LTR text
+            "\u{202B}مرحبا",              // unterminated RLE
+            "مرحبا\u{202C}",              // stray PDF
+            "\u{2067}\u{2067}\u{2067}مرحبا\u{2069}", // unbalanced nesting
+            "\u{202E}abc\u{202C}def",     // RLO around LTR text
+            "\u{2066}\u{2067}\u{2068}\u{2069}\u{202A}\u{202B}\u{202C}\u{202D}\u{202E}", // only controls
+        ];
+        for text in texts {
+            let galley = layout_bidi(text);
+            let glyph_count: usize = galley.rows.iter().map(|r| r.row.glyphs.len()).sum();
+            assert_eq!(
+                glyph_count,
+                text.chars().count(),
+                "one glyph per char for {text:?}"
+            );
+            let row_text: String = galley.rows.iter().map(|r| r.text()).collect();
+            assert_eq!(row_text, text, "logical text round-trips for {text:?}");
+            // Every cursor position must map to a finite position and back:
+            for i in 0..=galley.end().index.0 {
+                let rect = galley.pos_from_cursor(CCursor::new(i));
+                assert!(rect.is_finite(), "cursor {i} of {text:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn bidi_cursor_maps_both_ways() {
+        let text = "abc مرحبا";
+        let galley = layout_bidi(text);
+        let row = &galley.rows[0];
+
+        // Caret logically before an Arabic glyph is at its right (visual trailing) edge:
+        let arabic_index = text.chars().position(|c| c == 'م').unwrap();
+        let glyph = &row.row.glyphs[arabic_index];
+        assert_eq!(row.row.x_offset(CharIndex(arabic_index)), glyph.max_x());
+        // Caret logically before a Latin glyph is at its left edge:
+        assert_eq!(row.row.x_offset(CharIndex(0)), row.row.glyphs[0].pos.x);
+
+        // Clicking on a glyph's center selects a neighboring logical index,
+        // and the round-trip is stable:
+        for i in 0..=galley.end().index.0 {
+            let rect = galley.pos_from_cursor(CCursor::new(i));
+            assert!(rect.is_finite(), "cursor {i}");
+            let cursor = galley.cursor_from_pos(rect.center().to_vec2());
+            let rect2 = galley.pos_from_cursor(cursor);
+            assert!(
+                (rect.center().x - rect2.center().x).abs() <= row.row.glyphs[0].advance_width,
+                "cursor round-trip drifted too far at {i}: {rect:?} vs {rect2:?}"
+            );
+        }
+
+        // Clicking far left/right of the row maps to the visual ends:
+        let first = galley.cursor_from_pos(vec2(-100.0, row.pos.y + 1.0));
+        let last = galley.cursor_from_pos(vec2(10_000.0, row.pos.y + 1.0));
+        assert!(first.index <= last.index);
+    }
+
+    #[test]
+    fn bidi_text_wraps_without_panic() {
+        let mut fonts = test_fonts();
+        let text = "مرحبا بالعالم هذه جملة طويلة باللغة العربية للاختبار";
+        let mut job = LayoutJob::simple(
+            text.to_owned(),
+            FontId::proportional(14.0),
+            Color32::WHITE,
+            50.0,
+        );
+        job.wrap.break_anywhere = true;
+        let galley = layout(&mut fonts, 1.0, Arc::new(job));
+        assert!(galley.rows.len() > 1, "expected wrapping: {galley:?}");
+        let glyph_count: usize = galley.rows.iter().map(|r| r.row.glyphs.len()).sum();
+        assert_eq!(glyph_count, text.chars().count());
+        for row in &galley.rows {
+            assert!(row.row.bidi_levels.is_some());
+            // Within each row, every glyph has a finite position:
+            for glyph in &row.row.glyphs {
+                assert!(glyph.pos.x.is_finite());
+            }
+        }
+    }
+
+    #[test]
+    fn bidi_levels_kept_in_sync_when_elided() {
+        let mut fonts = test_fonts();
+        let mut job = LayoutJob::simple(
+            "مرحبا بالعالم".to_owned(),
+            FontId::proportional(14.0),
+            Color32::WHITE,
+            f32::INFINITY,
+        );
+        job.wrap = TextWrapping::truncate_at_width(30.0);
+        let galley = layout(&mut fonts, 1.0, Arc::new(job));
+        assert!(galley.elided);
+        let row = &galley.rows[0].row;
+        assert_eq!(row.glyphs.last().unwrap().chr, '…');
+        if let Some(levels) = &row.bidi_levels {
+            assert_eq!(
+                levels.len(),
+                row.glyphs.len(),
+                "levels must stay parallel to glyphs"
+            );
+        }
+    }
+
+    #[test]
+    fn bidi_multiple_paragraphs() {
+        let text = "Hello\nمرحبا\nworld";
+        let galley = layout_bidi(text);
+        assert_eq!(galley.rows.len(), 3);
+        assert!(galley.rows[0].row.bidi_levels.is_none());
+        assert!(galley.rows[1].row.bidi_levels.is_some());
+        assert!(galley.rows[2].row.bidi_levels.is_none());
+        // The Arabic row is visually reversed:
+        let glyphs = &galley.rows[1].row.glyphs;
+        for (a, b) in glyphs.iter().zip(glyphs.iter().skip(1)) {
+            assert!(a.pos.x > b.pos.x);
+        }
     }
 }

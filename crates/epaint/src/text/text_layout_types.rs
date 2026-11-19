@@ -874,6 +874,10 @@ pub struct Row {
     pub(crate) section_index_at_start: u32,
 
     /// One for each `char`.
+    ///
+    /// Always in logical (text) order, even for right-to-left text.
+    /// For bidirectional text the [`Glyph::pos`] of consecutive glyphs
+    /// is NOT monotone: the glyphs carry their _visual_ x positions.
     pub glyphs: Vec<Glyph>,
 
     /// Logical size based on font heights etc.
@@ -882,6 +886,18 @@ pub struct Row {
 
     /// The mesh, ready to be rendered.
     pub visuals: RowVisuals,
+
+    /// The bidi embedding level of each glyph, parallel to [`Self::glyphs`],
+    /// if the row contains any right-to-left text.
+    ///
+    /// `None` for pure-LTR rows (the common case), which are then
+    /// laid out exactly as if bidi support did not exist.
+    ///
+    /// The glyphs stay in logical order; the levels are only needed to map
+    /// between logical cursors and visual x positions (see [`Row::x_offset`]
+    /// and [`Row::char_at`]).
+    #[cfg_attr(feature = "serde", serde(default))]
+    pub(crate) bidi_levels: Option<Vec<u8>>,
 }
 
 /// The tessellated output of a row.
@@ -1002,6 +1018,11 @@ impl Row {
     /// Closest char at the desired x coordinate in row-relative coordinates.
     /// Returns something in the range `[0, char_count_excluding_newline()]`.
     pub fn char_at(&self, desired_x: f32) -> CharIndex {
+        if self.bidi_levels.is_some() {
+            // The glyphs are in logical order but their x positions are visual,
+            // so x is not monotone in the glyph order.
+            return self.char_at_bidi(desired_x);
+        }
         for (i, glyph) in self.glyphs.iter().enumerate() {
             if desired_x < glyph.logical_rect().center().x {
                 return CharIndex(i);
@@ -1010,9 +1031,90 @@ impl Row {
         self.char_count_excluding_newline()
     }
 
+    /// [`Self::char_at`] for rows with bidirectional content.
+    ///
+    /// Each glyph occupies a visual cell `[pos.x, max_x]`; the cells are
+    /// contiguous in visual order. A click on the leading half of a glyph
+    /// maps to the caret at its visual-leading edge — which for an RTL
+    /// glyph is the caret logically _after_ it, and vice versa.
+    fn char_at_bidi(&self, desired_x: f32) -> CharIndex {
+        let is_rtl = |index: usize| self.is_rtl_glyph(index);
+
+        // Find the leftmost glyph whose visual cell contains `desired_x`:
+        let mut hit: Option<usize> = None;
+        for (i, glyph) in self.glyphs.iter().enumerate() {
+            if glyph.pos.x <= desired_x
+                && desired_x < glyph.max_x()
+                && hit.is_none_or(|j| glyph.pos.x < self.glyphs[j].pos.x)
+            {
+                hit = Some(i);
+            }
+        }
+
+        if let Some(i) = hit {
+            let before = desired_x < self.glyphs[i].logical_rect().center().x;
+            // The visual-leading edge of an RTL glyph is logically behind it:
+            return CharIndex(if before == is_rtl(i) { i + 1 } else { i });
+        }
+
+        // Outside all cells (they are contiguous, so this means beyond either end):
+        // snap to the caret at the nearest visual end.
+        let Some((leftmost, _)) = self
+            .glyphs
+            .iter()
+            .enumerate()
+            .min_by(|(_, a), (_, b)| a.pos.x.total_cmp(&b.pos.x))
+        else {
+            return CharIndex::ZERO;
+        };
+        let (rightmost, _) = self
+            .glyphs
+            .iter()
+            .enumerate()
+            .max_by(|(_, a), (_, b)| a.pos.x.total_cmp(&b.pos.x))
+            .unwrap_or((leftmost, &self.glyphs[leftmost]));
+
+        if desired_x < self.glyphs[leftmost].pos.x {
+            // Before the visual start of the row:
+            CharIndex(if is_rtl(leftmost) {
+                leftmost + 1
+            } else {
+                leftmost
+            })
+        } else {
+            // Past the visual end of the row:
+            CharIndex(if is_rtl(rightmost) {
+                rightmost
+            } else {
+                rightmost + 1
+            })
+        }
+    }
+
+    /// Is the glyph at the given logical index part of an RTL run?
+    #[inline]
+    fn is_rtl_glyph(&self, index: usize) -> bool {
+        self.bidi_levels
+            .as_ref()
+            .and_then(|levels| levels.get(index))
+            .is_some_and(|level| level % 2 == 1)
+    }
+
     pub fn x_offset(&self, column: CharIndex) -> f32 {
         if let Some(glyph) = self.glyphs.get(column.0) {
-            glyph.pos.x
+            if self.is_rtl_glyph(column.0) {
+                // The caret logically before an RTL glyph sits at its
+                // visually trailing edge, which is on the right.
+                glyph.max_x()
+            } else {
+                glyph.pos.x
+            }
+        } else if self.is_rtl_glyph(self.glyphs.len().saturating_sub(1))
+            && !self.glyphs.is_empty()
+        {
+            // One-past-the-end of a row ending in an RTL run:
+            // the caret goes to the visual end of the run, i.e. the left edge.
+            self.glyphs.last().map_or(self.size.x, |glyph| glyph.pos.x)
         } else {
             self.size.x
         }

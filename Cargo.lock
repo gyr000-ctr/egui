@@ -1288,6 +1288,7 @@ dependencies = [
  "send_wrapper",
  "serde",
  "static_assertions",
+ "tempfile",
  "wasm-bindgen",
  "web-sys",
  "web-time",

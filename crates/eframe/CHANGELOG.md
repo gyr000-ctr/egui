@@ -7,6 +7,18 @@ This file is updated upon each release.
 Changes since the last release can be found at <https://github.com/emilk/egui/compare/latest...HEAD> or by running the `scripts/generate_changelog.py` script.
 
 
+## Unreleased
+### ⭐ Added
+* Persisted state is now versioned and migrated: the storage file gets a schema version, unknown fields from newer versions are preserved when saving, and a corrupt or too-new file is reported as a distinct `StorageLoadError` instead of being silently replaced [#8903](https://github.com/emilk/egui/pull/8903)
+* Saving now writes to a temporary file and renames it into place, so an interrupted save can't leave a corrupt storage file behind [#8903](https://github.com/emilk/egui/pull/8903)
+
+### 🔧 Changed
+* The storage file is now written with sorted keys, so saving the same state produces byte-identical files [#8903](https://github.com/emilk/egui/pull/8903)
+
+### 🐛 Fixed
+* Old (unversioned) storage files now load as-is and are upgraded on the next save, instead of relying on serde defaults [#8903](https://github.com/emilk/egui/pull/8903)
+
+
 ## 0.37.0 - 2026-10-15
 ### ⭐ Added
 * Add `system_fonts` feature (on by default) for rendering any glyph and colored emoji using the fonts installed on the system. Enable it if you use `default-features = false` [#8512](https://github.com/emilk/egui/pull/8512) by [@emilk](https://github.com/emilk)

@@ -209,7 +209,9 @@ pub use native::run::EframePumpStatus;
 #[cfg(not(target_arch = "wasm32"))]
 #[cfg(any(feature = "glow", feature = "wgpu_no_default_features"))]
 #[cfg(feature = "persistence")]
-pub use native::file_storage::storage_dir;
+pub use native::file_storage::{
+    STORAGE_SCHEMA_VERSION, StorageFile, StorageLoadError, storage_dir,
+};
 
 #[cfg(not(target_arch = "wasm32"))]
 pub mod icon_data;

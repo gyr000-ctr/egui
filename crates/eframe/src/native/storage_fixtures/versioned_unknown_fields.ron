@@ -1,0 +1,13 @@
+{
+    "eframe_storage_version": 1,
+    "values": {
+        "app": "(counter:3,name:\"hello\",note:\"Ünïcode — 東京 \\\"quoted\\\"\")",
+        "window": "(fullscreen:false,inner_size:(1280.0,720.0),theme:\"dark\")",
+    },
+    "future_settings": (
+        accent: Named(Blue),
+        density: 1.25,
+        flags: [true, false],
+    ),
+    "future_list": [1, 2, 3],
+}

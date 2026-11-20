@@ -7,7 +7,10 @@ pub mod run;
 pub(crate) mod macos;
 
 /// File storage which can be used by native backends.
-#[cfg(feature = "persistence")]
+///
+/// Also compiled in tests so the persistence format can be tested without
+/// enabling the `persistence` feature.
+#[cfg(any(feature = "persistence", test))]
 pub mod file_storage;
 
 pub(crate) mod winit_integration;

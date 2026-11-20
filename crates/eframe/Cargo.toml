@@ -11,7 +11,14 @@ readme = "README.md"
 repository = "https://github.com/emilk/egui/tree/main/crates/eframe"
 categories = ["gui", "game-development"]
 keywords = ["egui", "gui", "gamedev"]
-include = ["../../LICENSE-APACHE", "../../LICENSE-MIT", "**/*.rs", "Cargo.toml", "data/icon.png"]
+include = [
+  "../../LICENSE-APACHE",
+  "../../LICENSE-MIT",
+  "**/*.rs",
+  "src/native/storage_fixtures/*.ron",
+  "Cargo.toml",
+  "data/icon.png",
+]
 
 [package.metadata.docs.rs]
 all-features = true
@@ -299,3 +306,8 @@ wgpu = { workspace = true, optional = true }
 # Native dev dependencies for testing
 [target.'cfg(not(target_arch = "wasm32"))'.dev-dependencies]
 directories.workspace = true
+tempfile.workspace = true
+# `ron` and `serde` are optional dependencies above (enabled by `persistence`);
+# repeating them here lets the storage tests compile without that feature.
+ron = { workspace = true, features = ["integer128"] }
+serde.workspace = true
